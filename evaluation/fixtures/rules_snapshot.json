@@ -1,0 +1,180 @@
+{
+  "version": "620279caae1676df",
+  "exported_at": "2026-11-19T15:20:43.432553+00:00",
+  "count": 4,
+  "domains": [
+    "food"
+  ],
+  "rules": [
+    {
+      "id": 4,
+      "rule_id": "1",
+      "domain": "food",
+      "priority": 10,
+      "description": "We put the Seafood keyword for all the Seafood dishes except Short Eats",
+      "reasoning": "",
+      "condition_logic": "AND",
+      "is_active": 1,
+      "conditions": [
+        {
+          "condition_group": 1,
+          "condition_type": "flavor_is",
+          "value": "seafood",
+          "negate": false,
+          "operator": "AND"
+        },
+        {
+          "condition_group": 2,
+          "condition_type": "gk_contains",
+          "value": "Short Eats",
+          "negate": true,
+          "operator": "AND"
+        },
+        {
+          "condition_group": 3,
+          "condition_type": "sku_contains",
+          "value": "Seafood",
+          "negate": true,
+          "operator": "AND"
+        },
+        {
+          "condition_group": 4,
+          "condition_type": "flavor_is",
+          "value": "meat",
+          "negate": true,
+          "operator": "AND"
+        }
+      ],
+      "actions": [
+        {
+          "action_type": "add_gk",
+          "value": "Seafood"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "rule_id": "2",
+      "domain": "food",
+      "priority": 20,
+      "description": "We don't put Rice for Fried Rice",
+      "reasoning": "",
+      "condition_logic": "AND",
+      "is_active": 1,
+      "conditions": [
+        {
+          "condition_group": 1,
+          "condition_type": "bt_is",
+          "value": "Fried Rice",
+          "negate": false,
+          "operator": "AND"
+        },
+        {
+          "condition_group": 2,
+          "condition_type": "gk_contains",
+          "value": "Fried Rice",
+          "negate": false,
+          "operator": "AND"
+        }
+      ],
+      "actions": [
+        {
+          "action_type": "remove_gk",
+          "value": "Rice"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "rule_id": "3",
+      "domain": "food",
+      "priority": 30,
+      "description": "We don't put Short Eats keyword for Sweet Items",
+      "reasoning": "",
+      "condition_logic": "OR",
+      "is_active": 1,
+      "conditions": [
+        {
+          "condition_group": 1,
+          "condition_type": "bt_is",
+          "value": "Sweet Bun",
+          "negate": false,
+          "operator": "OR"
+        },
+        {
+          "condition_group": 2,
+          "condition_type": "bt_is",
+          "value": "Sweet Crepe",
+          "negate": false,
+          "operator": "OR"
+        },
+        {
+          "condition_group": 3,
+          "condition_type": "bt_is",
+          "value": "Sweet Pastry",
+          "negate": false,
+          "operator": "OR"
+        },
+        {
+          "condition_group": 4,
+          "condition_type": "bt_is",
+          "value": "Sweet Pie",
+          "negate": false,
+          "operator": "OR"
+        },
+        {
+          "condition_group": 5,
+          "condition_type": "bt_is",
+          "value": "Sweet Pizza",
+          "negate": false,
+          "operator": "OR"
+        },
+        {
+          "condition_group": 6,
+          "condition_type": "bt_is",
+          "value": "Sweet Roll",
+          "negate": false,
+          "operator": "OR"
+        }
+      ],
+      "actions": [
+        {
+          "action_type": "remove_gk",
+          "value": "Short Eats"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "rule_id": "4",
+      "domain": "food",
+      "priority": 40,
+      "description": "We don't put Side Dish keyword for Submarine",
+      "reasoning": "",
+      "condition_logic": "AND",
+      "is_active": 1,
+      "conditions": [
+        {
+          "condition_group": 1,
+          "condition_type": "gk_contains",
+          "value": "Submarine",
+          "negate": false,
+          "operator": "AND"
+        },
+        {
+          "condition_group": 2,
+          "condition_type": "gk_contains",
+          "value": "Side Dish",
+          "negate": false,
+          "operator": "AND"
+        }
+      ],
+      "actions": [
+        {
+          "action_type": "remove_gk",
+          "value": "Side Dish"
+        }
+      ]
+    }
+  ]
+}

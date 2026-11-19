@@ -1,0 +1,226 @@
+from pathlib import Path
+from unittest.mock import patch
+
+import httpx
+import numpy as np
+import pandas as pd
+import pytest
+
+from engine import config
+from engine.classification.tagger import tag_all_skus
+from engine.core.resource_loader import get_pipeline
+from engine.nlp.embedding_engine import EmbeddingEngine
+from engine.pipeline.audit_engine import run_sku_audit
+from engine.pipeline.processor import process_request
+
+
+def _require_synced_pipeline(domain: str = "food") -> None:
+    meta_path = Path(config.CACHE_DIR) / f"{domain}_catalog_metadata.pkl"
+    if (
+        not Path(config.EMBEDDING_ONNX).exists()
+        or not Path(config.get_bt_arcface_onnx_path(domain)).exists()
+        or not meta_path.exists()
+    ):
+        pytest.skip(f"Local ONNX models or synced '{domain}' catalog cache not found on disk")
+    try:
+        r = httpx.get(f"{config.QDRANT_URL.rstrip('/')}/readyz", timeout=1.0)
+        if r.status_code >= 500:
+            pytest.skip(f"Qdrant not ready at {config.QDRANT_URL}")
+    except Exception:
+        pytest.skip(f"Qdrant not reachable at {config.QDRANT_URL}")
+
+
+@pytest.mark.usefixtures("pg")
+class TestDefectFixes:
+    @pytest.mark.live_models
+    def test_bypass_score_normalization_at_source(self):
+        """Verify exact and fuzzy bypass paths write 1.0 instead of 100.0."""
+        _require_synced_pipeline("food")
+        matcher = get_pipeline("food")
+
+        # Test exact match bypass
+        exact_df = pd.DataFrame(
+            [{"Name": "Devilled Fish Set Menu", "description": "", "category": "", "price": 1500.0}]
+        )
+        match_res = matcher.process_inputs(exact_df)
+        assert len(match_res) == 1
+        row = match_res.iloc[0]
+        if row["Status"] == "High Confidence" and "Exact" in row["Logic Notes"]:
+            assert row["Final Score"] == 1.0, (
+                f"Expected exact match score 1.0, got {row['Final Score']}"
+            )
+
+        # Test audit engine exact bypass computed_score normalization
+        audit_res = run_sku_audit(
+            sku_name="Devilled Fish Set Menu", domain="food", task="matcher", price=1500.0
+        )
+        stage4 = audit_res.get("stage4_logic_gates", [])
+        if stage4 and stage4[0].get("fuzzy_bypass"):
+            assert stage4[0]["computed_score"] == 1.0, (
+                f"Expected computed_score 1.0, got {stage4[0]['computed_score']}"
+            )
+            assert stage4[0]["raw_cross_score"] == 100.0, (
+                "raw_cross_score logit sentinel should remain 100.0"
+            )
+
+    @pytest.mark.live_models
+    def test_fallback_variable_scoping_no_cross_sku_leak(self):
+        """Verify that fallback candidate from SKU 1 never leaks to SKU 2 in the same chunk."""
+        _require_synced_pipeline("food")
+        matcher = get_pipeline("food")
+
+        # SKU 1 is an obscure query that generates no high-confidence match
+        # SKU 2 is a distinct obscure query
+        test_df = pd.DataFrame(
+            [
+                {
+                    "Name": "ZzzNonExistentDishXyz123",
+                    "description": "",
+                    "category": "",
+                    "price": 100.0,
+                },
+                {
+                    "Name": "QqqAnotherFakeDish987",
+                    "description": "",
+                    "category": "",
+                    "price": 200.0,
+                },
+            ]
+        )
+        res = matcher.process_inputs(test_df)
+        assert len(res) == 2
+        # Both must produce independent rows and not crash
+        assert res.iloc[0]["Input Raw"] == "ZzzNonExistentDishXyz123"
+        assert res.iloc[1]["Input Raw"] == "QqqAnotherFakeDish987"
+
+    @pytest.mark.live_models
+    def test_zero_candidate_sku_preserves_positional_alignment(self):
+        """Verify that when a SKU produces 0 candidates, a placeholder row is appended and positions do not shift."""
+        _require_synced_pipeline("food")
+        matcher = get_pipeline("food")
+
+        test_df = pd.DataFrame(
+            [
+                {"Name": "Fish Fried Rice", "description": "", "category": "", "price": 1200.0},
+                {
+                    "Name": "ZeroCandSyntheticTestItem9999",
+                    "description": "",
+                    "category": "",
+                    "price": 500.0,
+                },
+                {"Name": "Chicken Biriyani", "description": "", "category": "", "price": 1500.0},
+            ]
+        )
+
+        res = matcher.process_inputs(test_df)
+        # Length must strictly equal 3
+        assert len(res) == 3, f"Expected 3 result rows, got {len(res)}"
+        assert res.iloc[0]["Input Raw"] == "Fish Fried Rice"
+        assert res.iloc[1]["Input Raw"] == "ZeroCandSyntheticTestItem9999"
+        assert res.iloc[2]["Input Raw"] == "Chicken Biriyani"
+        # Confirm required keys exist in placeholder row
+        for col in [
+            "Input Raw",
+            "Matched Catalog Name",
+            "Final Score",
+            "Status",
+            "Logic Notes",
+            "BasicType",
+            "GenericKeywords",
+        ]:
+            assert col in res.columns
+
+    @pytest.mark.live_models
+    def test_classifier_reasoning_generation_and_escalation_chaining(self):
+        """Verify classifier produces reasoning and pipeline escalation chains matcher note + classifier reasoning."""
+        _require_synced_pipeline("food")
+        # 1. tag_all_skus produces 'reasoning'
+        from engine.core.resource_loader import (
+            _get_shared_models,
+            _get_vector_store,
+            get_classifier,
+        )
+
+        classifier = get_classifier("food")
+        embed_engine, ner_engine = _get_shared_models()
+        vector_store = _get_vector_store()
+
+        embs = embed_engine.embed_weighted_sku(
+            ["Fish Curry"], [""], [""], weights=config.CLASSIFIER_WEIGHTS
+        )
+        query_embeddings = [
+            {
+                "dense": embs["dense"][0],
+                "bm25": (embs.get("bm25") or [{}])[0],
+                "sparse": (embs.get("sparse") or [None])[0],
+            }
+        ]
+
+        clf_results = tag_all_skus(
+            sku_names=["Fish Curry"],
+            sku_categories=[""],
+            query_embeddings=query_embeddings,
+            vector_store=vector_store,
+            reranker=None,
+            classifier=classifier,
+            sku_descriptions=[""],
+            sku_prices=[1000.0],
+            embed_engine=embed_engine,
+            ner_engine=getattr(classifier, "ner_engine", ner_engine),
+        )
+        assert len(clf_results) == 1
+        res = clf_results[0]
+        assert "reasoning" in res, "Expected 'reasoning' in tag_all_skus output dict"
+        assert "Classifier: BT=" in res["reasoning"] or (
+            "Classifier (" in res["reasoning"] and "BT=" in res["reasoning"]
+        ), f"Reasoning should format classifier details, got: {res['reasoning']}"
+
+        # 2. Pipeline escalation chains reasoning
+        sku = {
+            "name": "Devilled Fish Set Menu",
+            "description": "",
+            "category": "",
+            "price": 1500.0,
+        }
+        pip_res = process_request(task="pipeline", domain="food", skus=[sku])["results"][0]
+        # Verify confidence is clamped in [0.0, 1.0]
+        assert 0.0 <= pip_res.get("score", 0.0) <= 1.0
+        if pip_res.get("pipeline_source") == "Classifier":
+            assert pip_res.get("bt_confidence") is not None
+            assert 0.0 <= pip_res["bt_confidence"] <= 1.0
+            notes = pip_res.get("logic_notes", "")
+            assert "Classifier:" in notes or "Escalated from matcher" in notes
+        else:
+            assert pip_res.get("bt_confidence") is None
+
+        # Test SKU where matcher score is 0 / Low so classifier wins escalation
+        sku_unknown = {
+            "name": "Unmatchable Unknown Food Dish 98765",
+            "description": "",
+            "category": "",
+            "price": 500.0,
+        }
+        pip_res2 = process_request(task="pipeline", domain="food", skus=[sku_unknown])["results"][0]
+        if pip_res2.get("pipeline_source") == "Classifier":
+            notes2 = pip_res2.get("logic_notes", "")
+            assert "Escalated from matcher" in notes2 or "Classifier:" in notes2
+            assert pip_res2.get("bt_confidence") is not None
+            assert 0.0 <= pip_res2["bt_confidence"] <= 1.0
+
+
+def test_cross_encoder_empty_pairs_and_sentinel_handling():
+    """Verify score_cross_encoder handles empty batch and returns -10.0 sentinel if session is uninitialized."""
+    embed = EmbeddingEngine.__new__(EmbeddingEngine)
+    embed.cross_session = None
+    embed.rerank_tokenizer = None
+
+    # 1. Empty pairs returns empty array
+    empty_res = embed.score_cross_encoder([])
+    assert len(empty_res) == 0
+    assert isinstance(empty_res, np.ndarray)
+
+    # 2. When sessions are None, returns -10.0 sentinel
+    with patch.object(embed, "cross_session", None):
+        sentinel_res = embed.score_cross_encoder([["query", "doc1"], ["query", "doc2"]])
+        assert len(sentinel_res) == 2
+        assert np.all(sentinel_res == -10.0), f"Expected -10.0 sentinels, got {sentinel_res}"

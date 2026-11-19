@@ -1,0 +1,108 @@
+{
+  "exported_at": "2026-11-19T17:03:52.443746+00:00",
+  "rules": {
+    "version": null,
+    "count": null,
+    "domains": null
+  },
+  "sheets": {},
+  "added_market_gks": [],
+  "alignment": {
+    "food": {
+      "train_rows": 61017,
+      "test_rows": 15259,
+      "train_columns": [
+        "Name",
+        "Description",
+        "Flavor",
+        "Price",
+        "SellerCategory",
+        "GenericKeywords",
+        "BasicType",
+        "Region"
+      ],
+      "test_columns": [
+        "Name",
+        "Description",
+        "Price",
+        "SellerCategory",
+        "GenericKeywords",
+        "BasicType",
+        "Region"
+      ],
+      "bt": {
+        "dict_count": 909,
+        "train_count": 778,
+        "test_count": 613,
+        "test_unseen_in_train": [],
+        "train_not_in_dict": [],
+        "test_not_in_dict": []
+      },
+      "third_tag": {
+        "column": "Region",
+        "dict_count": 21,
+        "train_count": 20,
+        "test_count": 18,
+        "test_unseen_in_train": [
+          "Dutch"
+        ],
+        "train_not_in_dict": [],
+        "test_not_in_dict": []
+      },
+      "gk": {
+        "dict_count": 2054,
+        "train_count": 1572,
+        "test_count": 1349,
+        "test_unseen_in_train_count": 21,
+        "train_not_in_dict_count": 0,
+        "test_not_in_dict_count": 0
+      }
+    },
+    "market": {
+      "train_rows": 7421,
+      "test_rows": 1702,
+      "train_columns": [
+        "Name",
+        "Brand",
+        "Price",
+        "SellerCategory",
+        "Category",
+        "GenericKeywords",
+        "BasicType"
+      ],
+      "test_columns": [
+        "Name",
+        "Price",
+        "SellerCategory",
+        "Category",
+        "GenericKeywords",
+        "BasicType"
+      ],
+      "bt": {
+        "dict_count": 1541,
+        "train_count": 1529,
+        "test_count": 652,
+        "test_unseen_in_train": [],
+        "train_not_in_dict": [],
+        "test_not_in_dict": []
+      },
+      "third_tag": {
+        "column": "Category",
+        "dict_count": 17,
+        "train_count": 15,
+        "test_count": 15,
+        "test_unseen_in_train": [],
+        "train_not_in_dict": [],
+        "test_not_in_dict": []
+      },
+      "gk": {
+        "dict_count": 15659,
+        "train_count": 13362,
+        "test_count": 4675,
+        "test_unseen_in_train_count": 1635,
+        "train_not_in_dict_count": 0,
+        "test_not_in_dict_count": 0
+      }
+    }
+  }
+}

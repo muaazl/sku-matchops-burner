@@ -1,0 +1,32 @@
+# Local development overrides.
+#
+# `docker compose up` loads this file automatically and re-publishes the
+# internal service ports (PostgreSQL, Qdrant, engine) to the host so you can
+# reach their dashboards / API docs and run the Python services on the host
+# against the Dockerised databases (see README "Local Development").
+#
+# The hardened deployment intentionally does NOT use this file:
+#     docker compose -f docker-compose.yml up -d
+# then only the backend (8000) and frontend (5173) are reachable from the host.
+
+services:
+  postgres:
+    ports:
+      - "5432:5432"
+
+  pgbouncer:
+    ports:
+      - "6432:6432"
+
+  redis:
+    ports:
+      - "6379:6379"
+
+  qdrant:
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+
+  engine:
+    ports:
+      - "50051:50051"

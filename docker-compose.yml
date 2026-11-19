@@ -1,0 +1,202 @@
+services:
+  # Internal-only services (postgres, qdrant, engine) are NOT published to the
+  # host. They communicate over the private compose network by service name.
+  # For local debugging, docker-compose.override.yml re-publishes their ports.
+  postgres:
+    image: postgres:16-alpine
+    container_name: sku_matchops_postgres
+    expose:
+      - "5432"
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-matchops}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-matchops}
+      - POSTGRES_DB=${POSTGRES_DB:-matchops}
+    volumes:
+      - ./backend/data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-matchops} -d ${POSTGRES_DB:-matchops}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  # Postgres web UI at http://localhost:5050 (start with `docker compose --profile debug up -d pgadmin`).
+  # Bound to 127.0.0.1 only because desktop mode has no authentication.
+  pgadmin:
+    image: dpage/pgadmin4:8.14
+    container_name: sku_matchops_pgadmin
+    profiles:
+      - debug
+    ports:
+      - "127.0.0.1:5050:80"
+    environment:
+      - PGADMIN_DEFAULT_EMAIL=${PGADMIN_DEFAULT_EMAIL:-admin@example.com}
+      - PGADMIN_DEFAULT_PASSWORD=${PGADMIN_DEFAULT_PASSWORD:-matchops}
+      - PGADMIN_CONFIG_SERVER_MODE=False
+      - PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED=False
+    volumes:
+      - ./docker/pgadmin/servers.json:/pgadmin4/servers.json:ro
+    depends_on:
+      - postgres
+    restart: unless-stopped
+
+  # PgBouncer High-Performance Transaction Connection Pooler
+  pgbouncer:
+    image: edoburu/pgbouncer:1.22.1-p0
+    container_name: sku_matchops_pgbouncer
+    expose:
+      - "6432"
+    environment:
+      - DB_USER=${POSTGRES_USER:-matchops}
+      - DB_PASSWORD=${POSTGRES_PASSWORD:-matchops}
+      - DB_NAME=${POSTGRES_DB:-matchops}
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - LISTEN_PORT=6432
+      - POOL_MODE=transaction
+      - MAX_CLIENT_CONN=500
+      - DEFAULT_POOL_SIZE=25
+      - MIN_POOL_SIZE=5
+      - RESERVE_POOL_SIZE=5
+      - AUTH_TYPE=scram-sha-256
+      - IGNORE_STARTUP_PARAMETERS=extra_float_digits,options
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 6432 -U ${POSTGRES_USER:-matchops} -d ${POSTGRES_DB:-matchops}"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+      start_interval: 2s
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: sku_matchops_redis
+    expose:
+      - "6379"
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: sku_matchops_qdrant
+    expose:
+      - "6333"
+      - "6334"
+    volumes:
+      - ./engine/data/qdrant:/qdrant/storage:z
+    restart: unless-stopped
+
+  # Dedicated ML Engine Microservice
+  engine:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.engine
+    container_name: sku_matchops_engine
+    mem_limit: 6000m
+    expose:
+      - "50051"
+    environment:
+      - QDRANT_URL=http://qdrant:6333
+      - QDRANT_GRPC_PORT=6334
+      - QDRANT_PREFER_GRPC=true
+      - BACKEND_GRPC_URL=backend:50052
+      - ENGINE_GRPC_PORT=50051
+      - INTERNAL_GRPC_SECRET=${INTERNAL_GRPC_SECRET:-}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL}
+      - RERANKER_MODEL=${RERANKER_MODEL}
+      - TZ=Asia/Colombo
+      - REDIS_URL=redis://redis:6379/0
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - ./engine:/app/engine
+      - cache_data:/app/engine/data/cache
+      - models_data:/app/engine/models
+      - ./engine/models:/host_models:ro
+      - ./engine/data/cache:/host_cache:ro
+      - staged_data:/app/data/staged_sheets
+      - ./data/sample:/app/data/sample:ro
+      - ./scripts:/app/scripts
+      - ./docker/docker-entrypoint-engine.py:/app/docker-entrypoint-engine.py
+    depends_on:
+      qdrant:
+        condition: service_started
+      redis:
+        condition: service_started
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import grpc, sys; from engine import config; from engine.core.grpc_utils import grpc_metadata; from engine.protos import engine_service_pb2 as pb2, engine_service_pb2_grpc as g; r = g.EngineInferenceServiceStub(grpc.insecure_channel(f'127.0.0.1:{config.ENGINE_GRPC_PORT}')).GetHealth(pb2.Empty(), metadata=grpc_metadata(), timeout=3); sys.exit(0 if r.all_models_ready else 1)",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 120s
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.backend
+    container_name: sku_matchops_backend
+    mem_limit: 512m
+    ports:
+      - "8000:8000"
+    expose:
+      - "50052"
+    environment:
+      - ENGINE_GRPC_URL=engine:50051
+      - BACKEND_GRPC_PORT=50052
+      - BACKEND_GRPC_URL=backend:50052
+      - INTERNAL_GRPC_SECRET=${INTERNAL_GRPC_SECRET:-}
+      - TZ=Asia/Colombo
+      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=postgresql+psycopg://${POSTGRES_USER:-matchops}:${POSTGRES_PASSWORD:-matchops}@pgbouncer:6432/${POSTGRES_DB:-matchops}
+      - POSTGRES_HOST=pgbouncer
+      - POSTGRES_PORT=6432
+      - USE_PGBOUNCER=true
+      - PGBOUNCER_PORT=6432
+      - UVICORN_RELOAD=false
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - ./backend:/app/backend
+      - staged_data:/app/data/staged_sheets
+      - ./data/sample:/app/data/sample:ro
+      - ./scripts:/app/scripts
+      - ./docker/docker-entrypoint-backend.py:/app/docker-entrypoint-backend.py
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+      engine:
+        condition: service_started
+      redis:
+        condition: service_started
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: ${VITE_API_URL:-http://localhost:8000}
+    container_name: sku_matchops_frontend
+    mem_limit: 256m
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  models_data:
+  cache_data:
+  staged_data:
