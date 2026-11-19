@@ -380,13 +380,15 @@ def _resolve_hf_source(repo_id: str) -> str:
 
 def _load_hf_component(loader_fn, source: str, fallback_repo: str, local_only: bool, **kwargs):
     """Loads a HuggingFace model/config/tokenizer with fallback to remote download if local files are missing."""
+    optional_keys = ("fix_mistral_regex", "attn_implementation")
     try:
         return loader_fn(source, local_files_only=local_only, **kwargs)
-    except TypeError as type_err:
-        if "fix_mistral_regex" in kwargs:
-            clean_kwargs = {k: v for k, v in kwargs.items() if k != "fix_mistral_regex"}
-            return _load_hf_component(loader_fn, source, fallback_repo, local_only, **clean_kwargs)
-        raise type_err
+    except (TypeError, ValueError) as arg_err:
+        for opt_k in optional_keys:
+            if opt_k in kwargs:
+                clean_kwargs = {k: v for k, v in kwargs.items() if k != opt_k}
+                return _load_hf_component(loader_fn, source, fallback_repo, local_only, **clean_kwargs)
+        raise arg_err
     except (FileNotFoundError, OSError, Exception) as exc:
         if local_only and source != fallback_repo:
             logger.warning(
@@ -395,8 +397,8 @@ def _load_hf_component(loader_fn, source: str, fallback_repo: str, local_only: b
             )
             try:
                 return loader_fn(fallback_repo, local_files_only=False, **kwargs)
-            except TypeError:
-                clean_kwargs = {k: v for k, v in kwargs.items() if k != "fix_mistral_regex"}
+            except (TypeError, ValueError):
+                clean_kwargs = {k: v for k, v in kwargs.items() if k not in optional_keys}
                 return loader_fn(fallback_repo, local_files_only=False, **clean_kwargs)
         raise
 
@@ -698,8 +700,15 @@ def export_embedding(force: bool = False, require_int8: bool = True) -> bool:
         fix_mistral_regex=True,
     )
     tokenizer.padding_side = "right"
+    emb_load_kwargs: dict = {"trust_remote_code": True}
+    if "qwen" in str(getattr(hf_config, "model_type", "")).lower() or "jina" in model_id.lower():
+        emb_load_kwargs["attn_implementation"] = "eager"
     hf_model = _load_hf_component(
-        AutoModel.from_pretrained, source, hf_id, local_only, trust_remote_code=True
+        AutoModel.from_pretrained,
+        source,
+        hf_id,
+        local_only,
+        **emb_load_kwargs,
     )
     hf_model.eval()
     wrapper = EmbeddingONNXWrapper(hf_model, pooling=pooling, sparse_linear=sparse_linear)
@@ -839,7 +848,12 @@ def export_reranker(force: bool = False, require_int8: bool = True) -> bool:
 
     if arch_type == "listwise_lbnl":
         hf_model = _load_hf_component(
-            AutoModel.from_pretrained, source, model_id, local_only, trust_remote_code=True
+            AutoModel.from_pretrained,
+            source,
+            model_id,
+            local_only,
+            trust_remote_code=True,
+            attn_implementation="eager",
         )
         hf_model.eval()
         wrapper = RerankerONNXWrapper(hf_model, arch_type="listwise_lbnl")
@@ -863,6 +877,7 @@ def export_reranker(force: bool = False, require_int8: bool = True) -> bool:
                 "attention_mask": {0: "batch_size", 1: "sequence_length"},
                 "projected_embeds": {0: "batch_size", 1: "sequence_length"},
             },
+            prefer_dynamo=True,
         )
         unk_id = getattr(tokenizer, "unk_token_id", None)
         doc_id = tokenizer.convert_tokens_to_ids(doc_tok)
