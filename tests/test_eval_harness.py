@@ -10,8 +10,9 @@ import numpy as np
 import pandas as pd
 
 from engine import config
+from engine.nlp.embedding_engine import EmbeddingEngine
 from evaluation import metrics as M
-from evaluation import report, run_eval
+from evaluation import model_manager, report, run_eval
 
 
 def test_metrics_classification_multilabel_ranking_and_reranker_lift():
@@ -299,3 +300,79 @@ def test_run_eval_end_to_end_smoke_and_checkpoint_resume(tmp_path, monkeypatch):
             run_eval.VectorStore._client.close()
             run_eval.VectorStore._client = None
         run_eval.VectorStore._checked_collections.clear()
+
+
+def test_eval_engine_length_bucketing_and_oom_backoff(monkeypatch):
+    eng = model_manager.EvalEmbeddingEngine(
+        embedding_model=None, reranker_model=None, rerank_precision="fp16", batch_size=4
+    )
+    eng.rerank_backend = "onnx_cuda_fp16"
+
+    pairs = [
+        ["q_long_" + ("x" * 100), "d_long_" + ("y" * 100)],  # idx 0 (long -> OOM at bs > 1)
+        ["q1", "d1"],                                        # idx 1 (short)
+        ["q_med_" + ("a" * 30), "d_med_" + ("b" * 30)],      # idx 2 (medium -> OOM at bs > 2)
+        ["q2", "d2"],                                        # idx 3 (short)
+        ["q_long2_" + ("z" * 120), "d_long2_" + ("w" * 120)],  # idx 4 (longest -> OOM at bs > 1)
+    ]
+    seen_calls: list[list[str]] = []
+
+    def _fake_super_rerank(self, batch, batch_size=32, progress_callback=None):
+        seen_calls.append([p[0] for p in batch])
+        max_len = max(len(p[0]) + len(p[1]) for p in batch)
+        # Simulate BFC Arena OOM when long sequences are batched together.
+        if len(batch) > 2 and max_len > 60:
+            raise RuntimeError(
+                "onnxruntime_pybind11_state.Fail: bfc_arena.cc:360 Failed to allocate memory for requested buffer of size 1092874752"
+            )
+        if len(batch) > 1 and max_len > 200:
+            raise RuntimeError("CUDA out of memory.")
+        return np.array([float(len(p[0]) + len(p[1])) for p in batch], dtype=np.float32)
+
+    monkeypatch.setattr(EmbeddingEngine, "score_cross_encoder", _fake_super_rerank)
+
+    progress_events: list[tuple[int, int]] = []
+    scores = eng.score_cross_encoder(pairs, progress_callback=lambda d, t: progress_events.append((d, t)))
+    expected = np.array([float(len(p[0]) + len(p[1])) for p in pairs], dtype=np.float32)
+    np.testing.assert_allclose(scores, expected)
+    # First batch (batch_size=4) had indices [1, 3, 2, 0] sorted by length, which hit OOM -> halved to 2 -> [1, 3] succeeded,
+    # [2, 0] hit OOM (>200 chars with len>1) -> halved to 1 -> [2], [0], [4] each succeeded individually!
+    assert seen_calls[0] == ["q1", "q2", pairs[2][0], pairs[0][0]]
+    assert seen_calls[1] == ["q1", "q2"]
+    assert progress_events[0] == (0, 5)
+    assert progress_events[-1] == (5, 5)
+
+    # INT8 must preserve exact original pair order (no length sorting) for dynamic activation quantization.
+    eng_int8 = model_manager.EvalEmbeddingEngine(
+        embedding_model=None, reranker_model=None, rerank_precision="int8", batch_size=3
+    )
+    eng_int8.rerank_backend = "onnx_cpu_int8"
+    int8_calls: list[list[str]] = []
+
+    def _fake_int8_rerank(self, batch, batch_size=32, progress_callback=None):
+        int8_calls.append([p[0] for p in batch])
+        return np.array([1.0] * len(batch), dtype=np.float32)
+
+    monkeypatch.setattr(EmbeddingEngine, "score_cross_encoder", _fake_int8_rerank)
+    eng_int8.score_cross_encoder(pairs[:4])
+    assert int8_calls == [[pairs[0][0], pairs[1][0], pairs[2][0]], [pairs[3][0]]]
+
+    # CUDA ORT sessions must use kSameAsRequested arena extension to avoid power-of-two VRAM inflation.
+    monkeypatch.setattr(model_manager.ort, "get_available_providers", lambda: ["CUDAExecutionProvider", "CPUExecutionProvider"])
+    captured: dict[str, object] = {}
+
+    class _DummySession:
+        def get_providers(self):
+            return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+    def _fake_ort_sess(path, opts, providers=None):
+        captured["providers"] = providers
+        return _DummySession()
+
+    monkeypatch.setattr(model_manager.ort, "InferenceSession", _fake_ort_sess)
+    _, tag = model_manager._create_ort_session(model_manager.Path("dummy.onnx"), "fp16", device="cuda")
+    assert tag == "onnx_cuda_fp16"
+    assert captured["providers"] == [
+        ("CUDAExecutionProvider", {"arena_extend_strategy": "kSameAsRequested"}),
+        "CPUExecutionProvider",
+    ]

@@ -112,6 +112,35 @@ def _select_providers(precision: str, device: str = "auto") -> list[str]:
 _CUDA_PRELOADED = False
 
 
+def _is_oom_error(exc: Exception) -> bool:
+    """Returns True when an exception indicates GPU/CPU allocator or BFC arena OOM."""
+    oom_types = tuple(
+        t for t in (MemoryError, getattr(torch, "OutOfMemoryError", None)) if isinstance(t, type)
+    )
+    if oom_types and isinstance(exc, oom_types):
+        return True
+    msg = str(exc).lower()
+    return any(
+        needle in msg
+        for needle in (
+            "bfc_arena",
+            "failed to allocate memory",
+            "out of memory",
+            "outofmemory",
+            "cuda out of memory",
+            "cublas_status_alloc_failed",
+            "cudnn_status_alloc_failed",
+        )
+    )
+
+
+def _free_accelerator_memory() -> None:
+    """Triggers Python GC and releases PyTorch cached CUDA blocks after an OOM."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def _create_ort_session(onnx_path: Path, precision: str, device: str = "auto") -> tuple[ort.InferenceSession, str]:
     global _CUDA_PRELOADED
     opts = ort.SessionOptions()
@@ -121,13 +150,20 @@ def _create_ort_session(onnx_path: Path, precision: str, device: str = "auto") -
         opts.intra_op_num_threads = config.MAX_CPU_CORES
         opts.inter_op_num_threads = 1
     providers = _select_providers(precision, device=device)
-    if "CUDAExecutionProvider" in providers and not _CUDA_PRELOADED and hasattr(ort, "preload_dlls"):
+    uses_cuda = "CUDAExecutionProvider" in providers
+    if uses_cuda and not _CUDA_PRELOADED and hasattr(ort, "preload_dlls"):
         try:
             ort.preload_dlls()
         except Exception as err:
             logger.debug(f"[EVAL-MODELS] ort.preload_dlls skipped: {err}")
         _CUDA_PRELOADED = True
-    sess = ort.InferenceSession(str(onnx_path), opts, providers=providers)
+    ort_providers: list[Any] = [
+        ("CUDAExecutionProvider", {"arena_extend_strategy": "kSameAsRequested"})
+        if p == "CUDAExecutionProvider"
+        else p
+        for p in providers
+    ]
+    sess = ort.InferenceSession(str(onnx_path), opts, providers=ort_providers)
     active = sess.get_providers()
     ep_tag = "cuda" if active and active[0] == "CUDAExecutionProvider" else "cpu"
     return sess, f"onnx_{ep_tag}_{precision}"
@@ -579,6 +615,7 @@ class EvalEmbeddingEngine(EmbeddingEngine):
         self.embedding_dim = config.EMBEDDING_DIM
         self.has_learned_sparse = False
         self.emb_backend = "none"
+        self.emb_precision = emb_precision
         self.emb_artifacts: ModelArtifacts | None = None
 
         self.cross_session = None
@@ -591,6 +628,7 @@ class EvalEmbeddingEngine(EmbeddingEngine):
         self._doc_embed_token_id = 151670
         self._query_embed_token_id = 151671
         self.rerank_backend = "none"
+        self.rerank_precision = rerank_precision
         self.rerank_artifacts: ModelArtifacts | None = None
 
         if embedding_model:
@@ -684,7 +722,20 @@ class EvalEmbeddingEngine(EmbeddingEngine):
     def encode(
         self, texts: list[str], batch_size: int | None = None
     ) -> dict[str, np.ndarray | list[dict]]:
-        return super().encode(texts, batch_size=batch_size or self.batch_size)
+        cur_bs = max(1, int(batch_size or getattr(self, "batch_size", config.ONNX_BATCH_SIZE)))
+        while True:
+            try:
+                return super().encode(texts, batch_size=cur_bs)
+            except Exception as exc:
+                if _is_oom_error(exc) and cur_bs > 1:
+                    next_bs = max(1, cur_bs // 2)
+                    logger.warning(
+                        f"[EVAL-EMBED] OOM at batch_size={cur_bs}; freeing cache and retrying at batch_size={next_bs}."
+                    )
+                    _free_accelerator_memory()
+                    cur_bs = next_bs
+                    continue
+                raise
 
     def score_cross_encoder(
         self,
@@ -692,11 +743,74 @@ class EvalEmbeddingEngine(EmbeddingEngine):
         batch_size: int | None = None,
         progress_callback=None,
     ) -> np.ndarray:
-        return super().score_cross_encoder(
-            pairs,
-            batch_size=batch_size or self.batch_size,
-            progress_callback=progress_callback,
+        if not pairs:
+            return np.array([], dtype=np.float32)
+
+        cur_bs = max(1, int(batch_size or getattr(self, "batch_size", config.ONNX_BATCH_SIZE)))
+        arch = getattr(self, "_cross_arch", "cross_encoder")
+
+        if arch == "listwise_lbnl":
+            while True:
+                try:
+                    return super().score_cross_encoder(
+                        pairs, batch_size=cur_bs, progress_callback=progress_callback
+                    )
+                except Exception as exc:
+                    if _is_oom_error(exc) and cur_bs > 1:
+                        next_bs = max(1, cur_bs // 2)
+                        logger.warning(
+                            f"[EVAL-RERANK] OOM at block_size={cur_bs} (listwise); "
+                            f"freeing cache and retrying at block_size={next_bs}."
+                        )
+                        _free_accelerator_memory()
+                        cur_bs = next_bs
+                        continue
+                    raise
+
+        # Keep INT8 batch ordering verbatim (dynamic INT8 quantizes activations per-batch);
+        # sort FP16/FP32 by text length to avoid long outliers inflating every batch to 512 tokens.
+        is_int8 = getattr(self, "rerank_precision", None) == "int8" or str(
+            getattr(self, "rerank_backend", "")
+        ).endswith("_int8")
+        total = len(pairs)
+        order = (
+            list(range(total))
+            if is_int8
+            else sorted(range(total), key=lambda idx: len(str(pairs[idx][0])) + len(str(pairs[idx][1])))
         )
+
+        out = np.empty(total, dtype=np.float32)
+        if progress_callback:
+            progress_callback(0, total)
+
+        pos = 0
+        while pos < total:
+            take = min(cur_bs, total - pos)
+            batch_indices = order[pos : pos + take]
+            batch_pairs = [pairs[idx] for idx in batch_indices]
+            try:
+                batch_scores = super().score_cross_encoder(
+                    batch_pairs, batch_size=len(batch_pairs), progress_callback=None
+                )
+            except Exception as exc:
+                if _is_oom_error(exc) and cur_bs > 1:
+                    next_bs = max(1, cur_bs // 2)
+                    logger.warning(
+                        f"[EVAL-RERANK] OOM at batch_size={cur_bs} on slice [{pos}:{pos + take}]; "
+                        f"freeing cache and retrying at batch_size={next_bs}."
+                    )
+                    _free_accelerator_memory()
+                    cur_bs = next_bs
+                    continue
+                raise
+
+            for local_i, orig_idx in enumerate(batch_indices):
+                out[orig_idx] = float(batch_scores[local_i])
+            pos += take
+            if progress_callback:
+                progress_callback(pos, total)
+
+        return out
 
 
 def export_arcface_precisions(
